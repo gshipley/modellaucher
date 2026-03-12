@@ -61,6 +61,7 @@ When supported by your `llama-server` build, the launcher sets:
 ### Other families
 
 - DeepSeek-R1 gets reasoning-focused defaults.
+- Nemotron gets a recommended baseline of `temperature=1.0` and `top_p=0.95`.
 - Other families (Llama, Mistral, Gemma, Phi, GPT-OSS, unknown) get balanced/coding/creative presets.
 
 ## Context guidance
@@ -88,3 +89,9 @@ Only forward ports at your router if you explicitly want internet exposure.
 - If `llama-server` cannot be auto-detected, the launcher prompts for its path.
 - Unsupported `llama-server` flags are skipped with a clear note, instead of hard-failing.
 - `modelmenu` is a thin wrapper that runs `modelmenu.py`.
+
+## Troubleshooting
+
+- **Nemotron tensor shape mismatch (`check_tensor_dims`)**:
+  this usually indicates `llama.cpp` runtime compatibility for Nemotron Super GGUF.
+  Use the Unsloth `llama.cpp` `nvidia-fix` branch for Nemotron Super support.

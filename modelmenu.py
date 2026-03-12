@@ -101,6 +101,10 @@ FAMILY_INFO = {
         "GPT-OSS",
         "Open MoE model family; balanced defaults are usually a strong starting point.",
     ),
+    "nemotron": (
+        "Nemotron",
+        "NVIDIA Nemotron family; may require a patched llama.cpp build for some GGUF variants.",
+    ),
     "unknown": (
         "Unknown",
         "No special preset detected; using conservative defaults.",
@@ -118,6 +122,7 @@ FAMILY_COLOR_CODES = {
     "gemma": "32",
     "phi": "36",
     "gpt-oss": "1;95",
+    "nemotron": "1;33",
     "unknown": "37",
 }
 
@@ -254,6 +259,34 @@ DEEPSEEK_R1_PRESETS = [
     ),
 ]
 
+NEMOTRON_PRESETS = [
+    Preset(
+        key="nemotron_recommended",
+        label="Nemotron recommended (NVIDIA/Unsloth)",
+        description="Recommended baseline: temperature=1.0, top_p=0.95.",
+        ctx_size=16384,
+        temp=1.0,
+        top_p=0.95,
+        top_k=40,
+        min_p=0.0,
+        repeat_penalty=1.0,
+        presence_penalty=0.0,
+        recommended=True,
+    ),
+    Preset(
+        key="nemotron_precise",
+        label="Nemotron precise coding",
+        description="Lower entropy preset for deterministic coding outputs.",
+        ctx_size=16384,
+        temp=0.6,
+        top_p=0.9,
+        top_k=40,
+        min_p=0.0,
+        repeat_penalty=1.05,
+        presence_penalty=0.0,
+    ),
+]
+
 GENERIC_PRESETS = [
     Preset(
         key="balanced",
@@ -317,6 +350,8 @@ def detect_family(model_name: str) -> str:
         return "gemma"
     if "phi" in name:
         return "phi"
+    if "nemotron" in name:
+        return "nemotron"
     if "gpt-oss" in name or "gptoss" in squashed:
         return "gpt-oss"
     return "unknown"
@@ -540,6 +575,8 @@ def presets_for_family(family: str) -> list[Preset]:
         return QWEN35_PRESETS
     if family == "deepseek-r1":
         return DEEPSEEK_R1_PRESETS
+    if family == "nemotron":
+        return NEMOTRON_PRESETS
     return GENERIC_PRESETS
 
 
@@ -864,6 +901,18 @@ def main() -> int:
     print("Pick a preset number (or q to quit):")
     preset_idx = choose_index(len(presets), "Preset> ")
     selected_preset = presets[preset_idx - 1]
+
+    if selected_model.family == "nemotron":
+        print()
+        print(colorize("Nemotron compatibility note:", "1;33", use_color))
+        print(
+            colorize(
+                "If model loading fails with tensor shape mismatch, use Unsloth's llama.cpp "
+                "nvidia-fix branch for Nemotron Super GGUF files.",
+                "33",
+                use_color,
+            )
+        )
 
     print()
     print("Runtime settings (Enter accepts default):")
