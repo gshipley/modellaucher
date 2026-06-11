@@ -9,6 +9,7 @@ Interactive launcher for serving local GGUF models with `llama.cpp` and family-a
 - Reads GGUF metadata to show each model's maximum supported context.
 - Presents a cleaner interactive model menu with optional color output.
 - Includes tuned presets for common families, including Unsloth-style Qwen3.5 thinking/non-thinking modes.
+- Recommends hardware-aware runtime defaults, including Apple Silicon high-memory profiles.
 - Builds and runs the final `llama-server` command after confirmation.
 
 ## Requirements
@@ -36,6 +37,7 @@ python3 ./modelmenu.py
 ./modelmenu --models-dir ~/models
 ./modelmenu --llama-server ~/llama.cpp/llama-server
 ./modelmenu --host 0.0.0.0 --port 8000
+./modelmenu --hardware-profile apple-silicon-high-memory
 ./modelmenu --list-only
 ./modelmenu --dry-run
 ./modelmenu --color auto
@@ -72,6 +74,15 @@ During runtime settings, the prompt shows guidance like:
 ```text
 Context size (max 262,144) [16384]:
 ```
+
+The launcher now also recommends runtime defaults such as:
+
+- `--n-gpu-layers all` on Apple Silicon where full Metal offload is usually best.
+- `--flash-attn auto` when the local `llama-server` build supports it.
+- `--parallel` values based on model scale and host memory.
+- Larger default context windows on high-memory Apple Silicon hosts for large models.
+
+For an M3 Ultra / 512 GB class machine, the `apple-silicon-high-memory` profile is the closest explicit match if you want to force that behavior.
 
 ## Network access
 

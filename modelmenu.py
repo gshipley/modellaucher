@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import platform
 import re
 import shlex
 import shutil
@@ -154,6 +155,28 @@ class ModelEntry:
     sharded_parts: Optional[int]
     mmproj: Optional[Path]
     description: str
+
+
+@dataclass(frozen=True)
+class HardwareProfile:
+    key: str
+    label: str
+    description: str
+    logical_cores: int
+    performance_cores: Optional[int] = None
+    memory_gb: Optional[int] = None
+    unified_memory: bool = False
+
+
+@dataclass(frozen=True)
+class RuntimeDefaults:
+    ctx_size: int
+    threads: int
+    use_gpu: bool
+    n_gpu_layers: str
+    flash_attn: Optional[str]
+    parallel: Optional[int]
+    notes: tuple[str, ...] = ()
 
 
 def should_use_color(mode: str) -> bool:
@@ -589,6 +612,27 @@ def default_threads() -> int:
     return cpus - 2
 
 
+def recommended_threads_for_hardware(hardware: HardwareProfile) -> tuple[int, Optional[str]]:
+    if hardware.performance_cores:
+        return hardware.performance_cores, (
+            f"Threads default to the detected performance cores ({hardware.performance_cores}) instead of all logical cores."
+        )
+
+    if hardware.key == "apple-silicon-high-memory" and hardware.logical_cores >= 32:
+        inferred_perf_cores = 24
+        return inferred_perf_cores, (
+            f"Threads default to an inferred performance-core count ({inferred_perf_cores}) for this M3 Ultra-class profile."
+        )
+
+    if hardware.key == "apple-silicon" and hardware.logical_cores >= 16:
+        inferred_perf_cores = max(8, hardware.logical_cores - 4)
+        return inferred_perf_cores, (
+            f"Threads default to an inferred performance-core count ({inferred_perf_cores}) for Apple Silicon."
+        )
+
+    return default_threads(), None
+
+
 def find_llama_server(explicit: Optional[str]) -> Optional[Path]:
     candidates: list[Path] = []
     if explicit:
@@ -695,6 +739,218 @@ def ask_yes_no(prompt: str, default: bool = True) -> bool:
         print("Enter y or n.")
 
 
+def ask_choice(prompt: str, default: str, allowed: Iterable[str]) -> str:
+    allowed_set = {value.lower() for value in allowed}
+    allowed_text = "/".join(allowed)
+    while True:
+        raw = input(f"{prompt} [{default}]: ").strip().lower()
+        if not raw:
+            return default
+        if raw in allowed_set:
+            return raw
+        print(f"Enter one of: {allowed_text}.")
+
+
+def ask_n_gpu_layers(default: str) -> str:
+    while True:
+        raw = input(f"GPU layers [{default}]: ").strip().lower()
+        if not raw:
+            return default
+        if raw in {"auto", "all"}:
+            return raw
+        try:
+            value = int(raw)
+        except ValueError:
+            print("Enter a whole number, 'auto', or 'all'.")
+            continue
+        if value < 0:
+            print("Value must be >= 0.")
+            continue
+        return str(value)
+
+
+def run_text_command(parts: list[str], timeout: float = 2.0) -> Optional[str]:
+    try:
+        proc = subprocess.run(
+            parts,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout,
+        )
+    except Exception:
+        return None
+    output = (proc.stdout or "").strip()
+    if output:
+        return output
+    error_text = (proc.stderr or "").strip()
+    return error_text or None
+
+
+def detect_memory_gb() -> Optional[int]:
+    try:
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        phys_pages = os.sysconf("SC_PHYS_PAGES")
+        if page_size > 0 and phys_pages > 0:
+            return int((page_size * phys_pages) / (1024**3))
+    except (AttributeError, OSError, ValueError):
+        pass
+
+    if sys.platform == "darwin":
+        output = run_text_command(["sysctl", "-n", "hw.memsize"])
+        if output:
+            try:
+                return int(int(output) / (1024**3))
+            except ValueError:
+                return None
+    return None
+
+
+def detect_perf_cores() -> Optional[int]:
+    if sys.platform != "darwin":
+        return None
+    output = run_text_command(["sysctl", "-n", "hw.perflevel0.physicalcpu"])
+    if not output:
+        return None
+    try:
+        value = int(output)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def build_hardware_profile(profile_key: str) -> HardwareProfile:
+    logical_cores = os.cpu_count() or 4
+    performance_cores = detect_perf_cores()
+    memory_gb = detect_memory_gb()
+
+    if profile_key == "apple-silicon-high-memory":
+        memory_text = f"{memory_gb} GB unified memory" if memory_gb else "high-memory unified memory"
+        return HardwareProfile(
+            key=profile_key,
+            label="Apple Silicon high-memory",
+            description=f"M3 Ultra-class Mac profile tuned for very large GGUF and MoE models ({memory_text}).",
+            logical_cores=logical_cores,
+            performance_cores=performance_cores,
+            memory_gb=memory_gb,
+            unified_memory=True,
+        )
+    if profile_key == "apple-silicon":
+        memory_text = f"{memory_gb} GB unified memory" if memory_gb else "unified memory"
+        return HardwareProfile(
+            key=profile_key,
+            label="Apple Silicon",
+            description=f"Mac profile tuned for Metal offload on unified-memory systems ({memory_text}).",
+            logical_cores=logical_cores,
+            performance_cores=performance_cores,
+            memory_gb=memory_gb,
+            unified_memory=True,
+        )
+    memory_text = f", {memory_gb} GB RAM" if memory_gb else ""
+    return HardwareProfile(
+        key="generic",
+        label="Generic host",
+        description=f"Portable defaults based on detected CPU count{memory_text}.",
+        logical_cores=logical_cores,
+        performance_cores=performance_cores,
+        memory_gb=memory_gb,
+        unified_memory=False,
+    )
+
+
+def detect_hardware_profile(selection: str) -> HardwareProfile:
+    if selection != "auto":
+        return build_hardware_profile(selection)
+
+    is_apple_silicon = sys.platform == "darwin" and platform.machine() == "arm64"
+    memory_gb = detect_memory_gb()
+    if is_apple_silicon and memory_gb is not None and memory_gb >= 256:
+        return build_hardware_profile("apple-silicon-high-memory")
+    if is_apple_silicon:
+        return build_hardware_profile("apple-silicon")
+    return build_hardware_profile("generic")
+
+
+def parse_model_size_billions(size: Optional[str]) -> tuple[Optional[float], Optional[float]]:
+    if not size:
+        return None, None
+    match = SIZE_RE.search(size)
+    if not match:
+        return None, None
+    main = float(match.group("main"))
+    active = match.group("active")
+    return main, float(active) if active else None
+
+
+def recommend_runtime_defaults(
+    model: ModelEntry,
+    preset: Preset,
+    hardware: HardwareProfile,
+    known_flags: set[str],
+) -> RuntimeDefaults:
+    total_b, active_b = parse_model_size_billions(model.size)
+    effective_b = active_b if active_b is not None else total_b
+    very_large_moe = (total_b is not None and total_b >= 200) or (effective_b is not None and effective_b >= 50)
+    large_model = (total_b is not None and total_b >= 70) or (effective_b is not None and effective_b >= 20)
+
+    supports_flash_attn = not known_flags or "--flash-attn" in known_flags
+    supports_parallel = not known_flags or "--parallel" in known_flags
+
+    ctx_size = preset.ctx_size
+    threads, thread_note = recommended_threads_for_hardware(hardware)
+    use_gpu = True
+    n_gpu_layers = "99"
+    flash_attn = "auto" if supports_flash_attn else None
+    parallel = 1 if supports_parallel else None
+    notes: list[str] = []
+
+    if hardware.key == "apple-silicon-high-memory":
+        n_gpu_layers = "all"
+        if very_large_moe:
+            ctx_size = max(ctx_size, 131072)
+            parallel = 1 if supports_parallel else None
+            notes.append("Large MoE detected: defaulting to a single slot to preserve KV headroom and steadier latency.")
+        elif large_model:
+            ctx_size = max(ctx_size, 65536)
+            parallel = 2 if supports_parallel else None
+        else:
+            ctx_size = max(ctx_size, 32768)
+            parallel = 4 if supports_parallel else None
+        notes.append("Apple Silicon unified memory usually performs best with full Metal offload when the model fits.")
+    elif hardware.key == "apple-silicon":
+        n_gpu_layers = "all"
+        if very_large_moe:
+            ctx_size = max(ctx_size, 32768)
+            parallel = 1 if supports_parallel else None
+        elif large_model:
+            ctx_size = max(ctx_size, 16384)
+            parallel = 2 if supports_parallel else None
+        else:
+            parallel = 2 if supports_parallel else None
+        notes.append("Apple Silicon defaults lean toward full Metal offload and conservative server slot counts.")
+    else:
+        if very_large_moe:
+            parallel = 1 if supports_parallel else None
+        elif large_model and supports_parallel and (hardware.memory_gb or 0) >= 128:
+            parallel = 2
+
+    if thread_note:
+        notes.append(thread_note)
+
+    if model.max_context:
+        ctx_size = min(ctx_size, model.max_context)
+
+    return RuntimeDefaults(
+        ctx_size=ctx_size,
+        threads=max(1, threads),
+        use_gpu=use_gpu,
+        n_gpu_layers=n_gpu_layers,
+        flash_attn=flash_attn,
+        parallel=parallel,
+        notes=tuple(notes),
+    )
+
+
 def build_llama_server_cmd(
     llama_server: Path,
     model: ModelEntry,
@@ -704,7 +960,9 @@ def build_llama_server_cmd(
     alias: str,
     ctx_size: int,
     threads: int,
-    n_gpu_layers: int,
+    n_gpu_layers: str,
+    flash_attn: Optional[str],
+    parallel: Optional[int],
     known_flags: set[str],
 ) -> tuple[list[str], list[str]]:
     cmd: list[str] = [str(llama_server)]
@@ -727,6 +985,10 @@ def build_llama_server_cmd(
     add("--ctx-size", str(ctx_size))
     add("--threads", str(threads))
     add("--n-gpu-layers", str(n_gpu_layers))
+    if flash_attn is not None:
+        add("--flash-attn", flash_attn)
+    if parallel is not None:
+        add("--parallel", str(parallel))
 
     add("--temp", f"{preset.temp:g}")
     add("--top-p", f"{preset.top_p:g}")
@@ -752,6 +1014,18 @@ def format_context_window(value: Optional[int]) -> str:
     if value is None:
         return "unknown"
     return f"{value:,}"
+
+
+def describe_hardware_profile(hardware: HardwareProfile) -> str:
+    parts = [hardware.label]
+    if hardware.memory_gb:
+        memory_label = "unified memory" if hardware.unified_memory else "RAM"
+        parts.append(f"{hardware.memory_gb} GB {memory_label}")
+    if hardware.performance_cores:
+        parts.append(f"{hardware.performance_cores} perf cores")
+    elif hardware.logical_cores:
+        parts.append(f"{hardware.logical_cores} logical cores")
+    return " | ".join(parts)
 
 
 def format_metric(
@@ -842,6 +1116,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default="0.0.0.0", help="Default host for llama-server.")
     parser.add_argument("--port", type=int, default=8000, help="Default port for llama-server.")
     parser.add_argument(
+        "--hardware-profile",
+        choices=("auto", "generic", "apple-silicon", "apple-silicon-high-memory"),
+        default="auto",
+        help="Hardware-tuned defaults profile (default: auto-detect).",
+    )
+    parser.add_argument(
         "--list-only",
         action="store_true",
         help="List discovered models and exit.",
@@ -889,6 +1169,9 @@ def main() -> int:
     print()
     print(f"Using llama-server: {llama_server}")
     known_flags = supported_flags(llama_server)
+    hardware = detect_hardware_profile(args.hardware_profile)
+    print(colorize(f"Hardware profile: {describe_hardware_profile(hardware)}", "2;37", use_color))
+    print(colorize(hardware.description, "2;37", use_color))
 
     print()
     print("Pick a model number (or q to quit):")
@@ -914,6 +1197,31 @@ def main() -> int:
             )
         )
 
+    runtime_defaults = recommend_runtime_defaults(
+        model=selected_model,
+        preset=selected_preset,
+        hardware=hardware,
+        known_flags=known_flags,
+    )
+
+    print()
+    print(colorize("Recommended defaults for this model and host:", "1;36", use_color))
+    print(
+        colorize(
+            f"ctx={format_context_window(runtime_defaults.ctx_size)} "
+            f"threads={runtime_defaults.threads} "
+            f"gpu_layers={runtime_defaults.n_gpu_layers}",
+            "37",
+            use_color,
+        )
+    )
+    if runtime_defaults.flash_attn is not None:
+        print(colorize(f"flash_attn={runtime_defaults.flash_attn}", "37", use_color))
+    if runtime_defaults.parallel is not None:
+        print(colorize(f"parallel={runtime_defaults.parallel}", "37", use_color))
+    for note in runtime_defaults.notes:
+        print(colorize(f"- {note}", "2;37", use_color))
+
     print()
     print("Runtime settings (Enter accepts default):")
     host = ask_text("Host", args.host)
@@ -922,13 +1230,19 @@ def main() -> int:
         ctx_prompt = f"Context size (max {format_context_window(selected_model.max_context)})"
     else:
         ctx_prompt = "Context size"
-    ctx_size = ask_int(ctx_prompt, selected_preset.ctx_size, minimum=256)
-    threads = ask_int("Threads", default_threads(), minimum=1)
-    use_gpu = ask_yes_no("Enable GPU offload (--n-gpu-layers)", default=True)
+    ctx_size = ask_int(ctx_prompt, runtime_defaults.ctx_size, minimum=256)
+    threads = ask_int("Threads", runtime_defaults.threads, minimum=1)
+    use_gpu = ask_yes_no("Enable GPU offload (--n-gpu-layers)", default=runtime_defaults.use_gpu)
     if use_gpu:
-        n_gpu_layers = ask_int("GPU layers", 99, minimum=0)
+        n_gpu_layers = ask_n_gpu_layers(runtime_defaults.n_gpu_layers)
     else:
-        n_gpu_layers = 0
+        n_gpu_layers = "0"
+    flash_attn = runtime_defaults.flash_attn
+    if flash_attn is not None:
+        flash_attn = ask_choice("Flash attention (--flash-attn)", flash_attn, ("auto", "on", "off"))
+    parallel = runtime_defaults.parallel
+    if parallel is not None:
+        parallel = ask_int("Parallel server slots (--parallel)", parallel, minimum=1)
     alias = ask_text("Model alias", selected_model.path.stem)
 
     cmd, skipped_flags = build_llama_server_cmd(
@@ -941,6 +1255,8 @@ def main() -> int:
         ctx_size=ctx_size,
         threads=threads,
         n_gpu_layers=n_gpu_layers,
+        flash_attn=flash_attn,
+        parallel=parallel,
         known_flags=known_flags,
     )
 
